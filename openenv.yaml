@@ -1,0 +1,326 @@
+# ============================================================
+# openenv.yaml
+# ED Triage & Resource Allocation Environment — OpenEnv Spec
+# Version: 0.2.0
+# ============================================================
+
+env_name: EDTriageEnv
+version: "0.2.0"
+description: >
+  A discrete-time simulation of a Hospital Emergency Department (ED) triage
+  and resource-allocation problem. An agent (human or AI) decides how to
+  assign arriving patients to ICU, General Ward, or Observation bays,
+  or holds / discharges them. The environment models patient deterioration,
+  bed overflow, staff fatigue, and mass-casualty re-triage events.
+
+authors:
+  - name: "ED Triage Dev Team"
+    contact: "N/A"
+
+license: MIT
+
+# ------------------------------------------------------------
+# State Schema
+# ------------------------------------------------------------
+state_schema:
+  type: object
+  class: EDState      # ed_triage.schemas.EDState (Pydantic, frozen)
+  fields:
+
+    waiting_patients:
+      type: "list[Patient]"
+      description: >
+        Ordered list of patients waiting for a triage decision.
+        Head of list is acted on each step.
+
+    active_patients:
+      type: "list[Patient]"
+      description: >
+        Patients currently occupying a bed (ICU / General / Observation).
+        Auto-discharged after treatment_steps simulation steps.
+
+    available_beds:
+      type: BedInventory
+      description: Count of unoccupied beds per ward type.
+      fields:
+        icu:         { type: int, min: 0 }
+        general:     { type: int, min: 0 }
+        observation: { type: int, min: 0 }
+
+    staff:
+      type: StaffCount
+      description: On-duty clinical staff counts.
+      fields:
+        doctors: { type: int, min: 0 }
+        nurses:  { type: int, min: 0 }
+
+    time_elapsed:
+      type: int
+      unit: minutes
+      description: "Simulated wall-clock minutes elapsed (each step = 15 min)."
+      min: 0
+
+    step_count:
+      type: int
+      description: Discrete step index within the episode.
+      min: 0
+
+# Patient sub-schema (elements of waiting_patients / active_patients)
+patient_schema:
+  type: object
+  class: Patient    # ed_triage.schemas.Patient (Pydantic, frozen)
+  fields:
+    id:              { type: str }
+    name:            { type: str }
+    age:             { type: int, min: 0, max: 120 }
+    vitals:
+      type: Vitals
+      fields:
+        bp_systolic:  { type: int, unit: mmHg, min: 60,  max: 220 }
+        bp_diastolic: { type: int, unit: mmHg, min: 40,  max: 140 }
+        hr:           { type: int, unit: bpm,  min: 20,  max: 250 }
+        spo2:         { type: float, unit: "%", min: 50.0, max: 100.0 }
+        temp:         { type: float, unit: "°C", min: 32.0, max: 42.5 }
+    chief_complaint:  { type: str }
+    arrival_time:     { type: datetime, format: ISO-8601 }
+    severity_score:
+      type: float
+      min: 1.0
+      max: 5.0
+      description: >
+        ESI-inspired triage level.
+        1 = Immediate/life-threatening (ICU),
+        2 = Emergent (ICU),
+        3 = Urgent (General),
+        4 = Less urgent (Observation),
+        5 = Non-urgent (Observation).
+    assigned_tier:
+      type: str
+      enum: [ICU, General, Observation, Queue, Discharged]
+    wait_time:
+      type: int
+      unit: sim-steps
+      min: 0
+      description: Steps patient has spent in the waiting queue.
+
+# ------------------------------------------------------------
+# Action Schema
+# ------------------------------------------------------------
+action_schema:
+  type: enum
+  class: Action   # ed_triage.actions.Action
+  description: >
+    Discrete action space for the triage agent. Each action is applied
+    to the current head-of-queue patient.
+  values:
+    ASSIGN_ICU:
+      value: 1
+      description: >
+        Admit patient to an ICU bed. Optimal for severity 1–2.
+        Consuming an ICU bed when none are available triggers the
+        overflow penalty (−8) and returns the patient to the queue.
+    ASSIGN_GENERAL:
+      value: 2
+      description: >
+        Admit patient to a General Ward bed. Optimal for severity 3.
+    ASSIGN_OBSERVATION:
+      value: 3
+      description: >
+        Admit patient to an Observation bay. Optimal for severity 4–5.
+    HOLD_QUEUE:
+      value: 4
+      description: >
+        Keep patient in queue for this step. Penalised (−2) if a suitable
+        bed type is already available. Patient wait_time increments.
+    DISCHARGE:
+      value: 5
+      description: >
+        Release patient from the ED. Rewarded (+5) for stable patients,
+        heavily penalised (−20) for unstable patients.
+
+# ------------------------------------------------------------
+# Reward Function (Phase 1 + Phase 2)
+# ------------------------------------------------------------
+reward_schema:
+  class: RewardBreakdown   # ed_triage.reward.RewardBreakdown
+  components:
+
+    tier_reward:
+      description: Correctness of bed assignment relative to ideal tier.
+      values:
+        correct_tier:  +10.0
+        one_tier_off:   +3.0
+        wrong_tier:    -10.0
+
+    deterioration_penalty:
+      description: >
+        Penalty for each deterioration interval a patient has spent in queue.
+        Severity worsens −0.5 every 3 steps in queue.
+      per_deterioration_step: -5.0
+
+    overflow_penalty:
+      description: Penalty when a bed type is at 0 capacity but still assigned.
+      per_overflow: -8.0
+
+    discharge_reward:
+      description: Reward / penalty for DISCHARGE action.
+      stable:   +5.0
+      unstable: -20.0
+
+    hold_penalty:
+      description: >
+        Penalty when HOLD_QUEUE is chosen but a suitable bed is available.
+      per_unnecessary_hold: -2.0
+
+    # Phase 2 additions
+    time_decay_penalty:
+      description: Applied each step a critical patient (sev ≤ 2) is waiting.
+      per_step: -0.5
+
+    overcrowding_penalty:
+      description: Applied when any ward type is at 100% occupancy.
+      per_step: -3.0
+
+    critical_miss_penalty:
+      description: >
+        Applied when a severity ≤ 2 patient is assigned to Observation
+        or held in queue.
+      per_event: -25.0
+
+    efficient_discharge_bonus:
+      description: >
+        Bonus when a stable patient is discharged while a critical patient
+        is waiting, freeing up capacity for the critical patient.
+      per_event: +8.0
+
+    fatigue_modifier:
+      description: >
+        Multiplicative post-factor applied to the total reward after
+        step 20 (configurable per task). Models staff cognitive fatigue.
+      value: 0.85
+      activates_at_step: 20
+
+# ------------------------------------------------------------
+# Tasks
+# ------------------------------------------------------------
+tasks:
+
+  easy:
+    display_name: "Easy — Clear-Cut Triage"
+    description: >
+      5 patients with unambiguous vitals. All complain map cleanly to a
+      single correct tier. No new arrivals. Fatigue disabled.
+    initial_conditions:
+      n_patients: 5
+      bed_inventory: { icu: 4, general: 4, observation: 2 }
+      arrival_probability: 0.0
+      max_steps: 30
+      fatigue_active: false
+      retriage_events: []
+    success_criteria:
+      tier_accuracy: 1.0        # 100% correct tier assignments
+    scoring_weights:
+      accuracy: 1.0
+
+  medium:
+    display_name: "Medium — Hidden Severity"
+    description: >
+      15 patients in 3 arrival waves (every 5 steps). 8 beds total.
+      2 critical patients present with deceptively mild complaints.
+      Success requires zero critical misses and fast throughput.
+    initial_conditions:
+      n_patients: 15            # total across 3 waves
+      bed_inventory: { icu: 2, general: 4, observation: 2 }
+      arrival_probability: 0.0  # manual wave injection
+      max_steps: 40
+      fatigue_active: true
+      fatigue_from_step: 20
+      retriage_events: []
+    success_criteria:
+      zero_critical_misses: true
+      max_avg_wait_steps: 6.0
+    scoring_weights:
+      throughput: 0.60
+      critical_safety: 0.40
+
+  hard:
+    display_name: "Hard — Mass Casualty"
+    description: >
+      Mass casualty scenario. 40+ patients over 30 steps with high surge.
+      ICU starts at 80% full. Staff fatigue active from step 0.
+      5 patients change severity mid-episode (re-triage events).
+    initial_conditions:
+      n_patients: 40            # approximate (surge + initial)
+      bed_inventory: { icu: 1, general: 10, observation: 5 }
+      arrival_probability: 0.9
+      max_steps: 30
+      fatigue_active: true
+      fatigue_from_step: 0      # fatigue from the very first step
+      retriage_events:
+        - { at_step: 5,  patient_index: 0 }
+        - { at_step: 8,  patient_index: 2 }
+        - { at_step: 12, patient_index: 4 }
+        - { at_step: 16, patient_index: 6 }
+        - { at_step: 22, patient_index: 8 }
+    success_criteria:
+      max_mortality_rate: 0.05  # < 5% critical patients mishandled
+      min_utilization: 0.75     # > 75% bed utilization
+    scoring_weights:
+      mortality: 0.50
+      utilization: 0.30
+      speed: 0.20
+
+# ------------------------------------------------------------
+# LLM Integration
+# ------------------------------------------------------------
+llm_integration:
+  used: true
+  component: triage_helper
+  module: ed_triage.llm_helper
+  entrypoint: analyze_complaint
+  model: gemini-2.5-flash
+  role: >
+    Advisory hint only — the LLM analyzes the patient's free-text chief
+    complaint and returns a suggested tier, suspected condition, confidence
+    score, and list of red flags. The environment itself NEVER consults the
+    LLM; triage ground truth is always derived from the rule-based severity
+    score. The LLM output is surfaced to the agent / UI user as a labeled
+    badge to aid decision-making.
+  fallback: rule_based_keyword_classifier
+  api_key_env_var: OPENAI_API_KEY
+  output_schema:
+    suspected_condition: str
+    suggested_tier: { type: str, enum: [icu, general, observation] }
+    confidence: { type: float, min: 0.0, max: 1.0 }
+    red_flags: { type: "list[str]" }
+    _source: { type: str, enum: [llm, rule_based, rule_based_default, empty_input] }
+
+# ------------------------------------------------------------
+# Environment Lifecycle
+# ------------------------------------------------------------
+lifecycle:
+  reset: >
+    Resets all counters, rebuilds the patient queue, clears treatment timers,
+    and returns the initial EDState. Deterministic given the same seed.
+  step: >
+    (1) Compute reward for current patient + action.
+    (2) Apply action → transition state (pure functional).
+    (3) Register treatment timers for newly admitted patients.
+    (4) Auto-discharge patients whose treatment_steps timer expires.
+    (5) Probabilistic new patient arrival.
+    (6) Apply scheduled re-triage severity changes (task-driven).
+    (7) Advance step_count and time_elapsed.
+    Returns: (next_state, reward, done, info_dict)
+  termination:
+    - max_steps reached
+    - both waiting_patients and active_patients are empty
+
+# ------------------------------------------------------------
+# Determinism
+# ------------------------------------------------------------
+determinism:
+  seeded: true
+  seed_param: seed
+  rng: "python stdlib random.Random (not numpy)"
+  note: >
+    Same seed produces byte-identical episodes across Python versions ≥ 3.10.
